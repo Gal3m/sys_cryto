@@ -1,0 +1,105 @@
+# Overview
+
+I implemented the sys_cryptocopy system call in the Linux 5.4.3 kernel using a
+loadable module. Run make in this directory to compile the module and some test
+files. You can use insmod to insert the sys_cryptocopy.ko kernel module into
+the kernel, enabling the sys_cryptcopy system call.
+
+The file run_quick_test.sh will remove the module if it is already loaded,
+recompile it, insert it, and run a simple test program called quick_test which
+encrypts a small input file. No checks are performed for correct output,
+this script is just to ensure that everything executes without error.
+
+Within the tests directory, I have a script called run_tests.sh which runs
+through the 26 tests I created. These tests invoke one of two programs that
+call the sys_cryptocopy system call: inval_cryptocopy and test_cryptocopy.
+test_cryptocopy accepts the arguments specified in the assignment document and
+allows the user to encrypt, decrypt, and copy files using the system call.
+inval_cryptocopy allows additional invalid inputs to be passed to the system
+call which cannot be simulated using test_cryptocopy. The details of specific
+tests are listed at the bottom.
+
+# Design Decisions
+In order to encrypt/decrypt files, I use the ctr(aes) algorithm provided by the
+kernel Crypto API. This accepts key lengths of 16, 24, or 32. The system call
+returns -EINVAL if any other keylen is provided. Within test_cryptocopy, I
+generate a 32 bit key using the given password. This is done using a function
+from the OpenSSL LibCrypto library that conforms to PKCS#5: PKCS5_PBKDF2_HMAC
+with the sha256 digest algorithm. No salt is used since that wouldn't make
+sense in this context. The salt would need to be the same on different systems
+for encrypted files to be portable, but if everyone uses the same salt and the
+kernel is open source then that defeats the purpose. The ctr(aes) algorithm has
+a blocksize of 1 so there is no padding needed, I can simply pass any size data
+buffer to the crypo API functions.
+
+The preamble of all ciphertext files is 20 bytes long. This means the
+ciphertext file for an empty cleartext file is 20 bytes. The first 4 bytes
+store a digest of the key concatenated with the initialization vector. This is
+slightly different from the recommendation of the assignment document, which
+just suggests storing a hash of the key. If it was only a hash of the key,
+different input files encrypted with the same key would have the same digest in
+their preamble, which is a security concern. Since I implemented the extra
+credit to store the inode number in the initialization vector, including this
+in the data used to generate the digest makes the system more secure. The next
+16 bytes of the preamble represent the initialization vector. When decrypting a
+file, the initialization vector is read into a buffer and concatenated with the
+key provided by the user in order to generate a digest to check against the one
+written in the file. The digest is computed using the crc32 transformation from
+the kernel crypto API, which has a blocksize of 1 so if the code was changed to
+use different key lengths of IV sizes, no padding would be required. 
+
+If the output file already exists, I create a tmp file to write the output to
+which is later renamed to the output file. I first check whether the length of the file path
+is not so close to PATH_MAX so that the filename cannot be extended. If it is this
+long, I create the tmp file in the /tmp directory. Otherwise, I append random
+letters to the end of the output file name and try creating a file with this
+new name. I use get_random_bytes to get random letters in the range [a-zA-Z].
+The number of letters appended to the output filename is controlled by the
+TMPLEN preprocessor variable. The number of attempts that are made at creating
+a temp file is controlled by the MAX_TMP_ATTEMPTS variable. For testing
+purposes, I have TMPLEN set to 1 so that I can test what happens when every tmp
+file name is already taken. In this scenario, the program fails with errno
+EEXISTS.
+
+In order to set the permissions of the output file, I get the permissions of
+the input file using vfs_getattr and the umask for the current process using
+current->fs->umask. I then & the protection mode of the output file with the
+negation of the umask for the current process. A complication occurs if the
+output file already exists. /bin/cp will preserve the permissions of any
+existing output file, however this output file could potentially have less
+protection than the input file which is not allowed for sys_cryptocopy.
+Nevertheless, I choose the protection mode that is closest to what /bin/cp
+would output while still following the restriction of having greater or equal
+protection to the input file. This is done by taking the intersection of the
+protection mode after applying umask with the protection mode of the existing
+output file. 
+
+I also implemented the extra credit described in section 7.1.
+
+# Tests
+1. keybuf NULL pointer
+2. filename too long
+3. extraneous flags set
+4. keylen too short
+5. invalid flag combination
+6. infile NULL pointer
+7. outfile NULL pointer
+8. infile is symlink
+9. infile is does not exist
+10. infile is absolute path
+11. encrypt then decrypt empty infile
+12. infile is directory
+13. infile is not regular file (/dev/urandom)
+14. infile and outfile are the same
+15. infile is symlink to outfile
+16. infile is hardlink to outfile
+17. outfile is directory
+18. outfile already exists
+19. outfile exists and all tmp names are taken
+20. correctly encrypt and decrypt small infile
+21. correctly encrypt and decrypt large infile
+22. no read permission for infile
+23. no write permission for outfile
+24. follow umask for copying small infile
+25. decrypt with wrong key
+26. decrypt corrupt infile (too short)
